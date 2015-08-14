@@ -1,0 +1,121 @@
+#################################
+##### C * O * N * F * I * G #####
+#################################
+dork_pidfile="/tmp/dork.pid"
+dork_user="dork"
+dork_config="/home/${dork_user}/dorknet.conf"
+dork_motd="Welcome to dorknet"
+dork_ssh_command="command=\"/usr/bin/env echo '${dork_motd}'\",no-X11-forwarding,no-agent-forwarding,no-pty"
+# set -x #<- debug
+#################################
+
+export DORK_TOP_PID=$$
+trap '
+  parent="$(cat ${dork_pidfile})"
+  [ -z $parent ] && parent=$DORK_TOP_PID
+  rm "${dork_pidfile}"
+  pkill -TERM -P $DORK_TOP_PID
+' SIGINT SIGTERM EXIT
+
+dork_add() {
+  if [ ! -z "$2" ]; then
+    echo "${dork_ssh_command} ${2}" >> "/home/${dork_user}/.ssh/authorized_keys"
+  fi
+}
+
+dork_check() {
+  echo "$(ssh -p ${port} ${dork_user}@${host} echo misconfigured 2>&1)"
+}
+
+dork_init() {
+  if [ -z "$(grep "${dork_user}" /etc/passwd)" ]; then
+    sudo useradd -d "/home/${dork_user}" -m -N "${dork_user}"
+    sudo -u "${dork_user}" mkdir "/home/${dork_user}/.ssh"
+    sudo -u "${dork_user}" ssh-keygen -b 2048 -t rsa -f "/home/${dork_user}/.ssh/id_rsa" -q -N ""
+    sudo -u "${dork_user}" mkdir -p "$(dirname $dork_config)"
+    sudo -u "${dork_user}" touch "${dork_config}"
+  fi
+}
+
+dork_ipup() {
+  ping -q -w 1 -c 1 $(ip r | grep default | cut -d ' ' -f 3) > /dev/null && echo ok
+}
+
+dork_loop() {
+  for dork in ${dorks[@]}; do
+    host=$(echo $dork | cut -d\| -f1)
+    port=$(echo $dork | cut -d\| -f2)
+    mode=$(echo $dork | cut -d\| -f3)
+    conf=$(echo $dork | cut -d\| -f4)
+    if [[ $mode == "reverse" ]]; then
+      flag="-R"
+    fi
+    if [[ $mode == "dynamic" ]]; then
+      flag="-D"
+    fi
+    if [[ $mode == "forward" ]]; then
+      flag="-L"
+    fi
+    if [[ $connection_mode == "autossh" ]]; then
+      misconfigured_maybe="$(dork_check)"
+      if [[ "$misconfigured_maybe" != "$(echo "$dork_motd")" ]]; then
+        echo "Error: while processing ${dork}. The server is misconfigured or not responsive"
+        echo "       Response from remote was ${misconfigured_maybe}"
+      fi
+      ( autossh -M 0 -p ${port} -fN ${flag} ${conf} ${dork_user}@${host} ) & # Fucking zombies
+    else
+      echo "Error: while true ssh loop is not supported yet"
+    fi
+  done
+}
+
+dork_stop() {
+  [ ! -z $(cat "$dork_pidfile") ] && \
+    kill -s SIGINT $(cat "$dork_pidfile") || \
+    kill -s SIGINT $DORK_TOP_PID
+}
+
+dork_zombify() {
+  if [ ! -d "/home/${dork_user}/.ssh" ]; then
+    dork_init
+  fi
+  source "$dork_config"
+  if [ ! $dorks ]; then
+    dork_stop
+  else
+    while [ -z $(dork_ipup) ]; do
+      sleep 5
+    done
+    dork_loop
+  fi
+}
+
+dork_kill() {
+  killall autossh 2>/dev/null
+}
+
+if [ ! -z "$1" ]; then
+  echo -n $DORK_TOP_PID > "$dork_pidfile"
+  if [[ "$1" != "init" ]]; then
+    if [ $(whoami) != $dork_user ]; then
+      echo "Should be run as \`\`${dork_user}''."
+      dork_stop
+    fi
+  fi
+  dork_verbs=('init' 'zombify' 'add' 'kill')
+  for i in ${dork_verbs[@]}; do
+    if [ "$1" == "$i" ]; then
+      dork_$i "$@"
+      exit
+    fi
+  done
+else
+cat <<EOF
+USAGE
+
+dork init — bootstraps dork user, generates a key
+dork zombify — forks a bunch of autossh processes as specified by ${dork_config}
+dork add "somekeyhere" — adds a public key to the list of authorized keys, prefixing it with ${dork_ssh_command}
+dork kill — kills autossh sessions spawned by dork
+EOF
+fi
